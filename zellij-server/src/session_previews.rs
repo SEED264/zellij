@@ -12,6 +12,12 @@ use zellij_utils::sessions::{validate_session_folder_name, validate_session_name
 pub const REMOTE_PREVIEW_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const LOCAL_PREVIEW_ANSWER_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// How many bytes of pane contents a saved session preview may carry in total.
+///
+/// The preview reaches the plugin as a single event that it decodes inside its limited
+/// memory, so a session with a lot of serialized scrollback would otherwise crash it.
+const SAVED_PREVIEW_CONTENTS_BUDGET: usize = 1024 * 1024;
+
 fn preview_error(session_name: &str, tab_index: Option<usize>, error: String) -> SessionPreview {
     SessionPreview {
         session_name: session_name.to_owned(),
@@ -196,6 +202,60 @@ fn collect_floating_panes(layouts: &[FloatingPaneLayout], panes: &mut Vec<SavedP
     }
 }
 
+/// Trims the pane contents so that together they fit in `budget` bytes.
+///
+/// Panes smaller than an even share keep everything and the larger ones split what is
+/// left. A trimmed pane keeps its most recent lines, which is what the preview shows.
+fn bound_preview_contents(tabs: &mut [SavedTabPreview], budget: usize) {
+    let mut lengths: Vec<usize> = tabs
+        .iter()
+        .flat_map(|tab| tab.panes.iter())
+        .filter_map(|pane| pane.contents.as_ref().map(|contents| contents.len()))
+        .collect();
+    if lengths.iter().sum::<usize>() <= budget {
+        return;
+    }
+    lengths.sort_unstable();
+    let mut remaining = budget;
+    let mut cap = 0;
+    for (index, length) in lengths.iter().enumerate() {
+        let share = remaining / (lengths.len() - index);
+        if *length > share {
+            cap = share;
+            break;
+        }
+        remaining -= length;
+    }
+    for contents in tabs
+        .iter_mut()
+        .flat_map(|tab| tab.panes.iter_mut())
+        .filter_map(|pane| pane.contents.as_mut())
+    {
+        keep_tail(contents, cap);
+    }
+}
+
+/// Drops the start of `contents` so that at most `budget` bytes are left, cutting at
+/// the start of a line where possible.
+fn keep_tail(contents: &mut String, budget: usize) {
+    if contents.len() <= budget {
+        return;
+    }
+    let mut cut = contents.len() - budget;
+    while !contents.is_char_boundary(cut) {
+        cut += 1;
+    }
+    if contents.as_bytes()[cut - 1] != b'\n' {
+        if let Some(newline) = contents[cut..].find('\n') {
+            let next_line = cut + newline + 1;
+            if next_line < contents.len() {
+                cut = next_line;
+            }
+        }
+    }
+    contents.drain(..cut);
+}
+
 pub fn saved_session_preview_from_layout(
     session_name: &str,
     raw_layout: &str,
@@ -210,7 +270,7 @@ pub fn saved_session_preview_from_layout(
     ) {
         Ok(layout) => {
             let focused_tab = layout.focused_tab_index();
-            let tabs = layout
+            let mut tabs: Vec<SavedTabPreview> = layout
                 .tabs()
                 .into_iter()
                 .enumerate()
@@ -225,6 +285,7 @@ pub fn saved_session_preview_from_layout(
                     }
                 })
                 .collect();
+            bound_preview_contents(&mut tabs, SAVED_PREVIEW_CONTENTS_BUDGET);
             SavedSessionPreview {
                 session_name: session_name.to_owned(),
                 folder,
@@ -303,6 +364,111 @@ layout {
             preview.tabs[1].panes[0].command,
             Some("tail -f log.txt".to_owned())
         );
+    }
+
+    fn numbered_lines(prefix: &str, count: usize) -> String {
+        (1..=count).map(|n| format!("{} {}\n", prefix, n)).collect()
+    }
+
+    fn pane_with_contents(contents: &str) -> SavedPanePreview {
+        SavedPanePreview {
+            contents: Some(contents.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keep_tail_leaves_contents_within_the_budget_alone() {
+        let mut contents = "one\ntwo\n".to_owned();
+        keep_tail(&mut contents, 8);
+        assert_eq!(contents, "one\ntwo\n");
+    }
+
+    #[test]
+    fn keep_tail_keeps_the_last_whole_lines() {
+        let mut contents = "one\ntwo\nthree\n".to_owned();
+        keep_tail(&mut contents, 6);
+        assert_eq!(contents, "three\n");
+        let mut contents = "one\ntwo\nthree\n".to_owned();
+        keep_tail(&mut contents, 10);
+        assert_eq!(contents, "two\nthree\n");
+    }
+
+    #[test]
+    fn keep_tail_cuts_a_single_long_line_on_a_char_boundary() {
+        let mut contents = "あいうえお".to_owned();
+        keep_tail(&mut contents, 7);
+        assert_eq!(contents, "えお");
+    }
+
+    #[test]
+    fn previews_within_the_budget_are_left_alone() {
+        let mut tabs = vec![SavedTabPreview {
+            panes: vec![pane_with_contents("a\nb\n"), pane_with_contents("c\n")],
+            ..Default::default()
+        }];
+        let before = tabs.clone();
+        bound_preview_contents(&mut tabs, 6);
+        assert_eq!(tabs, before);
+    }
+
+    #[test]
+    fn small_panes_are_kept_and_large_ones_share_the_rest() {
+        let small = numbered_lines("small", 2);
+        let large = numbered_lines("large", 100);
+        let mut tabs = vec![
+            SavedTabPreview {
+                panes: vec![pane_with_contents(&small), pane_with_contents(&large)],
+                ..Default::default()
+            },
+            SavedTabPreview {
+                panes: vec![pane_with_contents(&large)],
+                ..Default::default()
+            },
+        ];
+        let budget = small.len() + 200;
+        bound_preview_contents(&mut tabs, budget);
+        let contents: Vec<&String> = tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| pane.contents.as_ref())
+            .collect();
+        assert_eq!(contents[0], &small);
+        for trimmed in &contents[1..] {
+            assert!(trimmed.len() <= 100, "{} bytes left", trimmed.len());
+            assert!(trimmed.ends_with("large 100\n"));
+            assert!(trimmed.starts_with("large "));
+        }
+    }
+
+    #[test]
+    fn saved_previews_of_sessions_with_large_scrollback_fit_the_budget() {
+        let folder = tempfile::tempdir().unwrap();
+        let big = numbered_lines("line", SAVED_PREVIEW_CONTENTS_BUDGET / 8);
+        std::fs::write(folder.path().join("initial_contents_1"), &big).unwrap();
+        std::fs::write(folder.path().join("initial_contents_2"), &big).unwrap();
+        let raw = r#"
+layout {
+    tab name="build" focus=true {
+        pane contents_file="initial_contents_1" focus=true
+        pane contents_file="initial_contents_2"
+    }
+}
+"#;
+        let layout_path = folder.path().join("session-layout.kdl");
+        let preview = saved_session_preview_from_layout("big", raw, Some(layout_path));
+        assert_eq!(preview.error, None);
+        let panes = &preview.tabs[0].panes;
+        let total: usize = panes
+            .iter()
+            .filter_map(|pane| pane.contents.as_ref())
+            .map(|contents| contents.len())
+            .sum();
+        assert!(total <= SAVED_PREVIEW_CONTENTS_BUDGET, "{} bytes", total);
+        let last_line = format!("line {}\n", SAVED_PREVIEW_CONTENTS_BUDGET / 8);
+        for pane in panes {
+            assert!(pane.contents.as_ref().unwrap().ends_with(&last_line));
+        }
     }
 
     #[test]
